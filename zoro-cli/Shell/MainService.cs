@@ -11,17 +11,22 @@ using Zoro.Wallets;
 using Zoro.Wallets.NEP6;
 using Zoro.Wallets.SQLite;
 using Zoro.Plugins;
+using Neo.VM;
 using Zoro.AppChain;
+using Zoro.Cryptography;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using ECCurve = Zoro.Cryptography.ECC.ECCurve;
 using ECPoint = Zoro.Cryptography.ECC.ECPoint;
+using System.Globalization;
+using System.Numerics;
 
 namespace Zoro.Shell
 {
@@ -86,6 +91,8 @@ namespace Zoro.Shell
                     return OnRebuildCommand(args);
                 case "send":
                     return OnSendCommand(args);
+		case "sendbcp":
+		    return OnSendBcpCommand(args);
                 case "show":
                     return OnShowCommand(args);
                 case "start":
@@ -398,6 +405,7 @@ namespace Zoro.Shell
                 "\texport key [address] [path]\n" +
                 "\timport multisigaddress m pubkeys...\n" +
                 "\tsend <id|alias> <address> <value>|all [fee=0]\n" +
+		"\tsendBcp <contract hash> <from> <to> <value>\n" +
                 "\tsign <jsonObjectToSign>\n" +
                 "Node Commands:\n" +
                 "\tshow state\n" +
@@ -740,6 +748,94 @@ namespace Zoro.Shell
                     return true;
                 }
             }
+            ContractParametersContext context = new ContractParametersContext(tx,Blockchain.Root);
+            Program.Wallet.Sign(context);
+            if (context.Completed)
+            {
+                tx.Witnesses = context.GetWitnesses();
+                Program.Wallet.ApplyTransaction(tx);
+                system.LocalNode.Tell(new LocalNode.Relay { Inventory = tx });
+                Console.WriteLine($"TXID: {tx.Hash}");
+            }
+            else
+            {
+                Console.WriteLine("SignatureContext:");
+                Console.WriteLine(context.ToString());
+            }
+            return true;
+        }
+
+        private bool OnSendBcpCommand(string[] args)
+        {
+             if (args.Length < 4 || args.Length > 5)
+            {
+                Console.WriteLine("error");
+                return true;
+            }
+            
+            UInt160 ContractHash = new UInt160(args[1].HexToBytes().Reverse().ToArray()); 
+            
+            if (NoWallet()) return true;
+            string password = ReadPassword("password");
+            if (password.Length == 0)
+            {
+                Console.WriteLine("cancelled");
+                return true;
+            }
+            if (!Program.Wallet.VerifyPassword(password))
+            {
+                Console.WriteLine("Incorrect password");
+                return true;
+            }
+            byte[] fromaddrhash = Zoro.Wallets.Helper.ToScriptHash(args[2]).ToArray();
+            byte[] toaddrhash = Zoro.Wallets.Helper.ToScriptHash(args[3]).ToArray(); 
+            byte[] vmscript = null;
+            ContractParameter[] parameters = new[]
+            {
+                new ContractParameter
+                {
+                    Type = ContractParameterType.String,
+                    Value = "transfer" 
+                },
+                new ContractParameter
+                {
+                    Type = ContractParameterType.ByteArray,
+                    Value = fromaddrhash
+                },
+                new ContractParameter
+                {
+                    Type = ContractParameterType.ByteArray,
+                    Value = toaddrhash
+                },
+                new ContractParameter
+                {
+                    Type = ContractParameterType.Integer,
+                    Value = BigInteger.Parse(args[4], NumberStyles.AllowHexSpecifier) 
+                }
+            };
+             using (ScriptBuilder sb = new ScriptBuilder())
+            {
+                sb.EmitAppCall(ContractHash, parameters);
+                vmscript = sb.ToArray();
+            }
+            
+            Fixed8 fee = Fixed8.Zero;
+            InvocationTransaction tx = new InvocationTransaction
+            {
+                ChainHash = UInt160.Zero,
+                Version = 1,
+                Script = vmscript,
+                Gas = fee
+            };
+
+            KeyPair keyPair = Program.Wallet.GetAccounts().FirstOrDefault(p => p.HasKey)?.GetKey();
+
+            tx.Inputs = new CoinReference[0];
+            tx.Outputs = new TransactionOutput[0];
+            tx.Attributes = new TransactionAttribute[1];
+            tx.Attributes[0] = new TransactionAttribute(); 
+            tx.Attributes[0].Usage = TransactionAttributeUsage.Script;
+            tx.Attributes[0].Data = Contract.CreateSignatureRedeemScript(keyPair.PublicKey).ToScriptHash().ToArray();
             ContractParametersContext context = new ContractParametersContext(tx, Blockchain.Root);
             Program.Wallet.Sign(context);
             if (context.Completed)
